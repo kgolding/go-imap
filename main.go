@@ -6,19 +6,17 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
-	retry "github.com/StirlingMarketingGroup/go-retry"
-	"github.com/davecgh/go-spew/spew"
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/jhillyerd/enmime"
-	. "github.com/logrusorgru/aurora"
+
 	"golang.org/x/net/html/charset"
 )
 
@@ -27,17 +25,6 @@ var AddSlashes = strings.NewReplacer(`"`, `\"`)
 
 // RemoveSlashes removes slashes before double quotes
 var RemoveSlashes = strings.NewReplacer(`\"`, `"`)
-
-// Verbose outputs every command and its response with the IMAP server
-var Verbose = false
-
-// SkipResponses skips printing server responses in verbose mode
-var SkipResponses = false
-
-// RetryCount is the number of times retired functions get retried
-var RetryCount = 10
-
-var lastResp string
 
 // Dialer is basically an IMAP connection
 type Dialer struct {
@@ -49,8 +36,8 @@ type Dialer struct {
 	Port      int
 	strtokI   int
 	strtok    string
-	Connected bool
-	ConnNum   int
+	connected bool
+	Logger    *log.Logger
 }
 
 // EmailAddresses are a map of email address to names
@@ -151,119 +138,45 @@ func (a Attachment) String() string {
 	return fmt.Sprintf("%s (%s %s)", a.Name, a.MimeType, humanize.Bytes(uint64(len(a.Content))))
 }
 
-var nextConnNum = 0
-var nextConnNumMutex = sync.RWMutex{}
-
-func log(connNum int, folder string, msg interface{}) {
-	var name string
-	if len(folder) != 0 {
-		name = fmt.Sprintf("IMAP%d:%s", connNum, folder)
-	} else {
-		name = fmt.Sprintf("IMAP%d", connNum)
+func New(username string, password string, host string, port int) *Dialer {
+	return &Dialer{
+		Username: username,
+		Password: password,
+		Host:     host,
+		Port:     port,
 	}
-	fmt.Println(Sprintf("%s %s: %s", time.Now().Format("2006-01-02 15:04:05.000000"), Colorize(name, CyanFg|BoldFm), msg))
 }
 
-// New makes a new imap
-func New(username string, password string, host string, port int) (d *Dialer, err error) {
-	nextConnNumMutex.RLock()
-	connNum := nextConnNum
-	nextConnNumMutex.RUnlock()
+func (d *Dialer) Connect() error {
+	d.log("", "establishing connection")
 
-	nextConnNumMutex.Lock()
-	nextConnNum++
-	nextConnNumMutex.Unlock()
-
-	err = retry.Retry(func() error {
-		if Verbose {
-			log(connNum, "", Green(Bold("establishing connection")))
-		}
-		var conn *tls.Conn
-		conn, err = tls.Dial("tcp", host+":"+strconv.Itoa(port), nil)
-		if err != nil {
-			if Verbose {
-				log(connNum, "", Red(Bold(fmt.Sprintf("failed to connect: %s", err))))
-			}
-			return err
-		}
-		d = &Dialer{
-			conn:      conn,
-			Username:  username,
-			Password:  password,
-			Host:      host,
-			Port:      port,
-			Connected: true,
-			ConnNum:   connNum,
-		}
-
-		return d.Login(username, password)
-	}, RetryCount, func(err error) error {
-		if Verbose {
-			log(connNum, "", Brown(Bold("failed to establish connection, retrying shortly")))
-			if d != nil && d.conn != nil {
-				d.conn.Close()
-			}
-		}
-		return nil
-	}, func() error {
-		if Verbose {
-			log(connNum, "", Brown(Bold("retrying failed connection now")))
-		}
-		return nil
-	})
+	conn, err := tls.Dial("tcp", d.Host+":"+strconv.Itoa(d.Port), nil)
 	if err != nil {
-		if Verbose {
-			log(connNum, "", Red(Bold("failed to establish connection")))
-			if d.conn != nil {
-				d.conn.Close()
-			}
-		}
-		return nil, err
+		d.log("", fmt.Sprintf("failed to connect: %s", err))
+		return err
 	}
+	d.conn = conn
+	d.connected = true
 
-	return
+	return d.Login(d.Username, d.Password)
 }
 
-// Clone returns a new connection with the same connection information
-// as the one this is being called on
-func (d *Dialer) Clone() (d2 *Dialer, err error) {
-	d2, err = New(d.Username, d.Password, d.Host, d.Port)
-	// d2.Verbose = d1.Verbose
-	if d.Folder != "" {
-		err = d2.SelectFolder(d.Folder)
-		if err != nil {
-			return nil, fmt.Errorf("imap clone: %s", err)
-		}
+func (d *Dialer) log(folder string, msg interface{}) {
+	if d.Logger != nil {
+		d.Logger.Println(msg)
 	}
-	return
 }
 
 // Close closes the imap connection
 func (d *Dialer) Close() (err error) {
-	if d.Connected {
-		if Verbose {
-			log(d.ConnNum, d.Folder, Brown(Bold("closing connection")))
-		}
+	if d.connected {
+		d.log(d.Folder, "closing connection")
 		err = d.conn.Close()
 		if err != nil {
 			return fmt.Errorf("imap close: %s", err)
 		}
-		d.Connected = false
+		d.connected = false
 	}
-	return
-}
-
-// Reconnect closes the current connection (if any) and establishes a new one
-func (d *Dialer) Reconnect() (err error) {
-	d.Close()
-	if Verbose {
-		log(d.ConnNum, d.Folder, Brown(Bold("reopening connection")))
-	}
-	d2, err := d.Clone()
-	if err != nil {
-		return fmt.Errorf("imap reconnect: %s", err)
-	}
-	*d = *d2
 	return
 }
 
@@ -283,105 +196,81 @@ func dropNl(b []byte) []byte {
 var atom = regexp.MustCompile(`{\d+}$`)
 
 // Exec executes the command on the imap connection
-func (d *Dialer) Exec(command string, buildResponse bool, retryCount int, processLine func(line []byte) error) (response string, err error) {
+func (d *Dialer) Exec(command string, buildResponse bool, processLine func(line []byte) error) (response string, err error) {
 	var resp strings.Builder
-	err = retry.Retry(func() (err error) {
-		tag := []byte(fmt.Sprintf("%X", bid2()))
+	tag := []byte(fmt.Sprintf("%X", bid2()))
 
-		c := fmt.Sprintf("%s %s\r\n", tag, command)
+	c := fmt.Sprintf("%s %s\r\n", tag, command)
 
-		if Verbose {
-			log(d.ConnNum, d.Folder, strings.Replace(fmt.Sprintf("%s %s", Bold("->"), strings.TrimSpace(c)), fmt.Sprintf(`"%s"`, d.Password), `"****"`, -1))
-		}
+	d.log(d.Folder, strings.Replace(fmt.Sprintf("%s %s", "->", strings.TrimSpace(c)), fmt.Sprintf(`"%s"`, d.Password), `"****"`, -1))
 
-		_, err = d.conn.Write([]byte(c))
-		if err != nil {
-			return
-		}
-
-		r := bufio.NewReader(d.conn)
-
-		if buildResponse {
-			resp = strings.Builder{}
-		}
-		var line []byte
-		for err == nil {
-			line, err = r.ReadBytes('\n')
-			for {
-				if a := atom.Find(dropNl(line)); a != nil {
-					// fmt.Printf("%s\n", a)
-					var n int
-					n, err = strconv.Atoi(string(a[1 : len(a)-1]))
-					if err != nil {
-						return
-					}
-
-					buf := make([]byte, n)
-					_, err = io.ReadFull(r, buf)
-					if err != nil {
-						return
-					}
-					line = append(line, buf...)
-
-					buf, err = r.ReadBytes('\n')
-					if err != nil {
-						return
-					}
-					line = append(line, buf...)
-
-					continue
-				}
-				break
-			}
-
-			if Verbose && !SkipResponses {
-				log(d.ConnNum, d.Folder, fmt.Sprintf("<- %s", dropNl(line)))
-			}
-
-			// if strings.Contains(string(line), "--00000000000030095105741e7f1f") {
-			// 	f, _ := ioutil.TempFile("", "")
-			// 	ioutil.WriteFile(f.Name(), line, 0777)
-			// 	fmt.Println(f.Name())
-			// }
-
-			if len(line) >= 19 && bytes.Equal(line[:16], tag) {
-				if !bytes.Equal(line[17:19], []byte("OK")) {
-					err = fmt.Errorf("imap command failed: %s", line[20:])
-					return
-				}
-				break
-			}
-
-			if processLine != nil {
-				if err = processLine(line); err != nil {
-					return
-				}
-			}
-			if buildResponse {
-				resp.Write(line)
-			}
-		}
-		return
-	}, retryCount, func(err error) error {
-		if Verbose {
-			log(d.ConnNum, d.Folder, Red(err))
-		}
-		d.Close()
-		return nil
-	}, func() error {
-		return d.Reconnect()
-	})
+	_, err = d.conn.Write([]byte(c))
 	if err != nil {
-		if Verbose {
-			log(d.ConnNum, d.Folder, Red(Bold("All retries failed")))
+		return
+	}
+
+	r := bufio.NewReader(d.conn)
+
+	if buildResponse {
+		resp = strings.Builder{}
+	}
+	var line []byte
+	for err == nil {
+		line, err = r.ReadBytes('\n')
+		for {
+			if a := atom.Find(dropNl(line)); a != nil {
+				// fmt.Printf("%s\n", a)
+				var n int
+				n, err = strconv.Atoi(string(a[1 : len(a)-1]))
+				if err != nil {
+					return
+				}
+
+				buf := make([]byte, n)
+				_, err = io.ReadFull(r, buf)
+				if err != nil {
+					return
+				}
+				line = append(line, buf...)
+
+				buf, err = r.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				line = append(line, buf...)
+
+				continue
+			}
+			break
 		}
+
+		d.log(d.Folder, fmt.Sprintf("<- %s", dropNl(line)))
+
+		if len(line) >= 19 && bytes.Equal(line[:16], tag) {
+			if !bytes.Equal(line[17:19], []byte("OK")) {
+				err = fmt.Errorf("imap command failed: %s", line[20:])
+				return
+			}
+			break
+		}
+
+		if processLine != nil {
+			if err = processLine(line); err != nil {
+				return
+			}
+		}
+		if buildResponse {
+			resp.Write(line)
+		}
+	}
+
+	if err != nil {
 		return "", err
 	}
 
 	if buildResponse {
 		if resp.Len() != 0 {
-			lastResp = resp.String()
-			return lastResp, nil
+			return resp.String(), nil
 		}
 		return "", nil
 	}
@@ -390,14 +279,14 @@ func (d *Dialer) Exec(command string, buildResponse bool, retryCount int, proces
 
 // Login attempts to login
 func (d *Dialer) Login(username string, password string) (err error) {
-	_, err = d.Exec(fmt.Sprintf(`LOGIN "%s" "%s"`, AddSlashes.Replace(username), AddSlashes.Replace(password)), false, RetryCount, nil)
+	_, err = d.Exec(fmt.Sprintf(`LOGIN "%s" "%s"`, AddSlashes.Replace(username), AddSlashes.Replace(password)), false, nil)
 	return
 }
 
 // GetFolders returns all folders
 func (d *Dialer) GetFolders() (folders []string, err error) {
 	folders = make([]string, 0)
-	_, err = d.Exec(`LIST "" "*"`, false, RetryCount, func(line []byte) (err error) {
+	_, err = d.Exec(`LIST "" "*"`, false, func(line []byte) (err error) {
 		line = dropNl(line)
 		if b := bytes.IndexByte(line, '\n'); b != -1 {
 			folders = append(folders, string(line[b+1:]))
@@ -429,87 +318,9 @@ func (d *Dialer) GetFolders() (folders []string, err error) {
 	return folders, nil
 }
 
-var regexExists = regexp.MustCompile(`\*\s+(\d+)\s+EXISTS`)
-
-// GetTotalEmailCount returns the total number of emails in every folder
-func (d *Dialer) GetTotalEmailCount() (count int, err error) {
-	return d.GetTotalEmailCountStartingFromExcluding("", nil)
-}
-
-// GetTotalEmailCountExcluding returns the total number of emails in every folder
-// excluding the specified folders
-func (d *Dialer) GetTotalEmailCountExcluding(excludedFolders []string) (count int, err error) {
-	return d.GetTotalEmailCountStartingFromExcluding("", excludedFolders)
-}
-
-// GetTotalEmailCountStartingFrom returns the total number of emails in every folder
-// after the specified start folder
-func (d *Dialer) GetTotalEmailCountStartingFrom(startFolder string) (count int, err error) {
-	return d.GetTotalEmailCountStartingFromExcluding(startFolder, nil)
-}
-
-// GetTotalEmailCountStartingFromExcluding returns the total number of emails in every folder
-// after the specified start folder, excluding the specified folders
-func (d *Dialer) GetTotalEmailCountStartingFromExcluding(startFolder string, excludedFolders []string) (count int, err error) {
-	started := true
-	if len(startFolder) != 0 {
-		started = false
-	}
-
-	folder := d.Folder
-
-	folders, err := d.GetFolders()
-	if err != nil {
-		return
-	}
-
-	for _, f := range folders {
-		if !started {
-			if f == startFolder {
-				started = true
-			} else {
-				continue
-			}
-		}
-
-		skip := false
-		for _, ef := range excludedFolders {
-			if f == ef {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-
-		err = d.SelectFolder(f)
-		if err != nil {
-			return
-		}
-
-		var n int
-		n, err = strconv.Atoi(regexExists.FindStringSubmatch(lastResp)[1])
-		if err != nil {
-			return
-		}
-
-		count += n
-	}
-
-	if len(folder) != 0 {
-		err = d.SelectFolder(folder)
-		if err != nil {
-			return
-		}
-	}
-
-	return
-}
-
 // SelectFolder selects a folder
 func (d *Dialer) SelectFolder(folder string) (err error) {
-	_, err = d.Exec(`SELECT "`+AddSlashes.Replace(folder)+`"`, true, RetryCount, nil)
+	_, err = d.Exec(`SELECT "`+AddSlashes.Replace(folder)+`"`, true, nil)
 	if err != nil {
 		return
 	}
@@ -519,7 +330,7 @@ func (d *Dialer) SelectFolder(folder string) (err error) {
 
 // ExamineFolder selects a folder in read only mode
 func (d *Dialer) ExamineFolder(folder string) (err error) {
-	_, err = d.Exec(`EXAMINE "`+AddSlashes.Replace(folder)+`"`, true, RetryCount, nil)
+	_, err = d.Exec(`EXAMINE "`+AddSlashes.Replace(folder)+`"`, true, nil)
 	if err != nil {
 		return
 	}
@@ -531,7 +342,7 @@ func (d *Dialer) ExamineFolder(folder string) (err error) {
 func (d *Dialer) GetUIDs(search string) (uids []int, err error) {
 	uids = make([]int, 0)
 	t := []byte{' ', '\r', '\n'}
-	r, err := d.Exec(`UID SEARCH `+search, true, RetryCount, nil)
+	r, err := d.Exec(`UID SEARCH `+search, true, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -604,124 +415,109 @@ func (d *Dialer) GetEmails(uids ...int) (emails map[int]*Email, err error) {
 	}
 
 	var records [][]*Token
-	err = retry.Retry(func() (err error) {
-		r, err := d.Exec("UID FETCH "+uidsStr.String()+" BODY.PEEK[]", true, 0, nil)
-		if err != nil {
-			return
-		}
+	r, err := d.Exec("UID FETCH "+uidsStr.String()+" BODY.PEEK[]", true, nil)
+	if err != nil {
+		return
+	}
 
-		records, err = d.ParseFetchResponse(r)
-		if err != nil {
-			return
-		}
+	records, err = d.ParseFetchResponse(r)
+	if err != nil {
+		return
+	}
 
-		for _, tks := range records {
-			e := &Email{}
-			skip := 0
-			success := true
-			for i, t := range tks {
-				if skip > 0 {
-					skip--
-					continue
-				}
-				if err = d.CheckType(t, []TType{TLiteral}, tks, "in root"); err != nil {
+	for _, tks := range records {
+		e := &Email{}
+		skip := 0
+		success := true
+		for i, t := range tks {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			if err = d.CheckType(t, []TType{TLiteral}, tks, "in root"); err != nil {
+				return
+			}
+			switch t.Str {
+			case "BODY[]":
+				if err = d.CheckType(tks[i+1], []TType{TAtom}, tks, "after BODY[]"); err != nil {
 					return
 				}
-				switch t.Str {
-				case "BODY[]":
-					if err = d.CheckType(tks[i+1], []TType{TAtom}, tks, "after BODY[]"); err != nil {
-						return
-					}
-					msg := tks[i+1].Str
-					r := strings.NewReader(msg)
+				msg := tks[i+1].Str
+				r := strings.NewReader(msg)
 
-					env, err := enmime.ReadEnvelope(r)
-					if err != nil {
-						if Verbose {
-							log(d.ConnNum, d.Folder, Brown(Sprintf("email body could not be parsed, skipping: %s", err)))
-							spew.Dump(env)
-							spew.Dump(msg)
-							// os.Exit(0)
-						}
-						success = false
+				env, err := enmime.ReadEnvelope(r)
+				if err != nil {
+					d.log(d.Folder, "email body could not be parsed, skipping: "+err.Error())
+					success = false
 
-						// continue RecL
-					} else {
+					// continue RecL
+				} else {
 
-						e.Subject = env.GetHeader("Subject")
-						e.Text = env.Text
-						e.HTML = env.HTML
+					e.Subject = env.GetHeader("Subject")
+					e.Text = env.Text
+					e.HTML = env.HTML
 
-						if len(env.Attachments) != 0 {
-							for _, a := range env.Attachments {
-								e.Attachments = append(e.Attachments, Attachment{
-									Name:     a.FileName,
-									MimeType: a.ContentType,
-									Content:  a.Content,
-								})
-							}
-						}
-
-						if len(env.Inlines) != 0 {
-							for _, a := range env.Inlines {
-								e.Attachments = append(e.Attachments, Attachment{
-									Name:     a.FileName,
-									MimeType: a.ContentType,
-									Content:  a.Content,
-								})
-							}
-						}
-
-						for _, a := range []struct {
-							dest   *EmailAddresses
-							header string
-						}{
-							{&e.From, "From"},
-							{&e.ReplyTo, "Reply-To"},
-							{&e.To, "To"},
-							{&e.CC, "cc"},
-							{&e.BCC, "bcc"},
-						} {
-							alist, _ := env.AddressList(a.header)
-							(*a.dest) = make(map[string]string, len(alist))
-							for _, addr := range alist {
-								(*a.dest)[strings.ToLower(addr.Address)] = addr.Name
-							}
+					if len(env.Attachments) != 0 {
+						for _, a := range env.Attachments {
+							e.Attachments = append(e.Attachments, Attachment{
+								Name:     a.FileName,
+								MimeType: a.ContentType,
+								Content:  a.Content,
+							})
 						}
 					}
-					skip++
-				case "UID":
-					if err = d.CheckType(tks[i+1], []TType{TNumber}, tks, "after UID"); err != nil {
-						return
+
+					if len(env.Inlines) != 0 {
+						for _, a := range env.Inlines {
+							e.Attachments = append(e.Attachments, Attachment{
+								Name:     a.FileName,
+								MimeType: a.ContentType,
+								Content:  a.Content,
+							})
+						}
 					}
-					e.UID = tks[i+1].Num
-					skip++
+
+					for _, a := range []struct {
+						dest   *EmailAddresses
+						header string
+					}{
+						{&e.From, "From"},
+						{&e.ReplyTo, "Reply-To"},
+						{&e.To, "To"},
+						{&e.CC, "cc"},
+						{&e.BCC, "bcc"},
+					} {
+						alist, _ := env.AddressList(a.header)
+						(*a.dest) = make(map[string]string, len(alist))
+						for _, addr := range alist {
+							(*a.dest)[strings.ToLower(addr.Address)] = addr.Name
+						}
+					}
 				}
-			}
-
-			if success {
-				emails[e.UID].Subject = e.Subject
-				emails[e.UID].From = e.From
-				emails[e.UID].ReplyTo = e.ReplyTo
-				emails[e.UID].To = e.To
-				emails[e.UID].CC = e.CC
-				emails[e.UID].BCC = e.BCC
-				emails[e.UID].Text = e.Text
-				emails[e.UID].HTML = e.HTML
-				emails[e.UID].Attachments = e.Attachments
-			} else {
-				delete(emails, e.UID)
+				skip++
+			case "UID":
+				if err = d.CheckType(tks[i+1], []TType{TNumber}, tks, "after UID"); err != nil {
+					return
+				}
+				e.UID = tks[i+1].Num
+				skip++
 			}
 		}
-		return
-	}, RetryCount, func(err error) error {
-		log(d.ConnNum, d.Folder, Red(Bold(err)))
-		d.Close()
-		return nil
-	}, func() error {
-		return d.Reconnect()
-	})
 
+		if success {
+			emails[e.UID].Subject = e.Subject
+			emails[e.UID].From = e.From
+			emails[e.UID].ReplyTo = e.ReplyTo
+			emails[e.UID].To = e.To
+			emails[e.UID].CC = e.CC
+			emails[e.UID].BCC = e.BCC
+			emails[e.UID].Text = e.Text
+			emails[e.UID].HTML = e.HTML
+			emails[e.UID].Attachments = e.Attachments
+		} else {
+			delete(emails, e.UID)
+		}
+	}
 	return
 }
 
@@ -745,28 +541,16 @@ func (d *Dialer) GetOverviews(uids ...int) (emails map[int]*Email, err error) {
 	}
 
 	var records [][]*Token
-	err = retry.Retry(func() (err error) {
-		r, err := d.Exec("UID FETCH "+uidsStr.String()+" ALL", true, 0, nil)
-		if err != nil {
-			return
-		}
-
-		if len(r) == 0 {
-			return
-		}
-
-		records, err = d.ParseFetchResponse(r)
-		if err != nil {
-			return
-		}
+	r, err := d.Exec("UID FETCH "+uidsStr.String()+" ALL", true, nil)
+	if err != nil {
 		return
-	}, RetryCount, func(err error) error {
-		log(d.ConnNum, d.Folder, Red(Bold(err)))
-		d.Close()
-		return nil
-	}, func() error {
-		return d.Reconnect()
-	})
+	}
+
+	if len(r) == 0 {
+		return
+	}
+
+	records, err = d.ParseFetchResponse(r)
 	if err != nil {
 		return nil, err
 	}
@@ -873,7 +657,7 @@ func (d *Dialer) GetOverviews(uids ...int) (emails map[int]*Email, err error) {
 
 							// if t.Tokens[EEMailbox].Type == TNil {
 							// 	if Verbose {
-							// 		log(d.ConnNum, d.Folder, Brown("email address has no mailbox name (probably not a real email), skipping"))
+							// 		d.log(d.Folder, Brown("email address has no mailbox name (probably not a real email), skipping"))
 							// 	}
 							// 	continue RecordsL
 							// }
@@ -1172,7 +956,7 @@ func (d *Dialer) CheckType(token *Token, acceptableTypes []TType, tks []*Token, 
 			}
 			types += GetTokenName(a)
 		}
-		err = fmt.Errorf("IMAP%d:%s: expected %s token %s, got %+v in %v", d.ConnNum, d.Folder, types, fmt.Sprintf(loc, v...), token, tks)
+		err = fmt.Errorf("IMAP%d:%s: expected %s token %s, got %+v in %v", d.Folder, types, fmt.Sprintf(loc, v...), token, tks)
 	}
 
 	return err
