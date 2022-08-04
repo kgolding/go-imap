@@ -16,7 +16,6 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/jhillyerd/enmime"
-
 	"golang.org/x/net/html/charset"
 )
 
@@ -161,6 +160,20 @@ func (d *Dialer) Connect() error {
 	return d.Login(d.Username, d.Password)
 }
 
+func (d *Dialer) ConnectWithTlsConfig(config *tls.Config) error {
+	d.log("", "establishing connection")
+
+	conn, err := tls.Dial("tcp", d.Host+":"+strconv.Itoa(d.Port), config)
+	if err != nil {
+		d.log("", fmt.Sprintf("failed to connect: %s", err))
+		return err
+	}
+	d.conn = conn
+	d.connected = true
+
+	return d.Login(d.Username, d.Password)
+}
+
 func (d *Dialer) log(folder string, msg interface{}) {
 	if d.Logger != nil {
 		d.Logger.Println(msg)
@@ -292,6 +305,9 @@ func (d *Dialer) GetFolders() (folders []string, err error) {
 			folders = append(folders, string(line[b+1:]))
 		} else {
 			i := len(line) - 1
+			if len(line) == 0 {
+				return
+			}
 			quoted := line[i] == '"'
 			delim := byte(' ')
 			if quoted {
@@ -956,7 +972,7 @@ func (d *Dialer) CheckType(token *Token, acceptableTypes []TType, tks []*Token, 
 			}
 			types += GetTokenName(a)
 		}
-		err = fmt.Errorf("IMAP%d:%s: expected %s token %s, got %+v in %v", d.Folder, types, fmt.Sprintf(loc, v...), token, tks)
+		err = fmt.Errorf("IMAP:%s: expected %s token %s, got %+v in %v", d.Folder, types, fmt.Sprintf(loc, v...), token, tks)
 	}
 
 	return err
