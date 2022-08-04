@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ var RemoveSlashes = strings.NewReplacer(`\"`, `"`)
 
 // Dialer is basically an IMAP connection
 type Dialer struct {
-	conn      *tls.Conn
+	conn      net.Conn
 	Folder    string
 	Username  string
 	Password  string
@@ -137,6 +138,7 @@ func (a Attachment) String() string {
 	return fmt.Sprintf("%s (%s %s)", a.Name, a.MimeType, humanize.Bytes(uint64(len(a.Content))))
 }
 
+// New returns a Dialer which now needs one of the Connect... methods calling
 func New(username string, password string, host string, port int) *Dialer {
 	return &Dialer{
 		Username: username,
@@ -146,8 +148,9 @@ func New(username string, password string, host string, port int) *Dialer {
 	}
 }
 
+// Connect attempts to connect and login using TLS typically on port 993
 func (d *Dialer) Connect() error {
-	d.log("", "establishing connection")
+	d.log("", "establishing TLS connection")
 
 	conn, err := tls.Dial("tcp", d.Host+":"+strconv.Itoa(d.Port), nil)
 	if err != nil {
@@ -160,8 +163,44 @@ func (d *Dialer) Connect() error {
 	return d.Login(d.Username, d.Password)
 }
 
+// Connect attempts to connect and login a direct TCP connection with no TLS security typically on port 143
+func (d *Dialer) ConnectNoTls() error {
+	d.log("", "establishing connection with no TLS")
+
+	hostAndPort := d.Host + ":" + strconv.Itoa(d.Port)
+	conn, err := net.Dial("tcp", hostAndPort)
+	if err != nil {
+		d.log("", fmt.Sprintf("failed to connect: %s", err))
+		return err
+	}
+	d.conn = conn
+	d.connected = true
+
+	return d.Login(d.Username, d.Password)
+}
+
+// ConnectAuto trys to connect using TLS, else with TLS skipping cert verification else with no TLS
+func (d *Dialer) ConnectAuto() error {
+	d.log("", "establishing connection, prefer TLS")
+
+	err := d.Connect() // Try with TLS
+	if err != nil {    // Else try with insecure TLS
+		err = d.ConnectWithTlsConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	if err != nil { // Else try with with no TLS
+		err = d.ConnectNoTls()
+	}
+	if err != nil {
+		d.log("", fmt.Sprintf("failed to connect: %s", err))
+		return err
+	}
+
+	return err
+}
+
+// ConnectWithTlsConfig runs Connect using a custom tls config
 func (d *Dialer) ConnectWithTlsConfig(config *tls.Config) error {
-	d.log("", "establishing connection")
+	d.log("", "establishing TLS connection with user config")
 
 	conn, err := tls.Dial("tcp", d.Host+":"+strconv.Itoa(d.Port), config)
 	if err != nil {
